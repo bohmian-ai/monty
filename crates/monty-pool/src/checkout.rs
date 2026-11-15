@@ -991,7 +991,27 @@ impl Checkout {
     /// this future mid-servicing abandons the feed's mount state and is
     /// treated exactly like a cancellation mid-turn: the worker is discarded
     /// on the next call.
+    ///
+    /// It is [`Checkout::service_mounts`] followed by
+    /// [`Checkout::resume_serviced`]; a caller that must not hold a scarce
+    /// resource across the host I/O calls the two itself.
     pub async fn resume_from_mounts(&mut self, on_print: OnPrint<'_>) -> Result<Option<TurnEvent>, PoolError> {
+        match self.service_mounts().await? {
+            Some(value) => self.resume_serviced(value, on_print).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Services a pending [`TurnEvent::OsCall`] from this feed's mounts without
+    /// resuming the sandbox.
+    ///
+    /// `Ok(Some(value))` means a mount serviced the call, possibly into an
+    /// error such as `PermissionError`; pass `value` to
+    /// [`Checkout::resume_serviced`]. `Ok(None)` means no mount covers the call
+    /// and the suspension is left intact, as for [`Checkout::resume_from_mounts`].
+    /// The host I/O and its cancellation rules are those of
+    /// [`Checkout::resume_from_mounts`]; the worker stays suspended throughout.
+    pub async fn service_mounts(&mut self) -> Result<Option<ResumeValue>, PoolError> {
         self.ensure_ready()?;
         let Some(Pending::Call { os_call, .. }) = &mut self.pending else {
             return Err(PoolError::Protocol("no suspended call to resume".into()));
@@ -1024,24 +1044,10 @@ impl Checkout {
             None => MountCallOutcome::NotHandled(*call),
         };
         match outcome {
-            MountCallOutcome::Handled(result) => {
-                let value = match result {
-                    Ok(obj) => ResumeValue::Return(obj),
-                    Err(err) => ResumeValue::Error(err.into_exception()),
-                };
-                match self.resume(value, &mut *on_print).await {
-                    // The result never reached the child (too large or too deep
-                    // to encode), so the call is still suspended — answer it
-                    // with that error instead, letting the sandbox raise a
-                    // catchable exception rather than stranding the feed. Only
-                    // a rejection before the frame is written leaves `pending`
-                    // set, so this cannot catch a genuine sandbox exception.
-                    Err(PoolError::Runtime(exc)) if self.pending.is_some() => {
-                        self.resume(ResumeValue::Error(exc), on_print).await.map(Some)
-                    }
-                    other => other.map(Some),
-                }
-            }
+            MountCallOutcome::Handled(result) => Ok(Some(match result {
+                Ok(obj) => ResumeValue::Return(obj),
+                Err(err) => ResumeValue::Error(err.into_exception()),
+            })),
             MountCallOutcome::NotHandled(call) => {
                 let Some(Pending::Call { os_call, .. }) = &mut self.pending else {
                     unreachable!("checked above");
@@ -1049,6 +1055,24 @@ impl Checkout {
                 *os_call = Some(Box::new(call));
                 Ok(None)
             }
+        }
+    }
+
+    /// Resumes the sandbox with `value`, an answer [`Checkout::service_mounts`]
+    /// returned.
+    ///
+    /// A result that never reached the child (too large or too deep to
+    /// encode) leaves the call suspended, so it is answered with that error
+    /// instead, letting the sandbox raise a catchable exception rather than
+    /// stranding the feed.
+    pub async fn resume_serviced(&mut self, value: ResumeValue, on_print: OnPrint<'_>) -> Result<TurnEvent, PoolError> {
+        match self.resume(value, &mut *on_print).await {
+            // Only a rejection before the frame is written leaves `pending`
+            // set, so this cannot catch a genuine sandbox exception.
+            Err(PoolError::Runtime(exc)) if self.pending.is_some() => {
+                self.resume(ResumeValue::Error(exc), on_print).await
+            }
+            other => other,
         }
     }
 
