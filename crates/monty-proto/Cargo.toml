@@ -54,10 +54,15 @@ python = ["dep:pyo3", "dep:strum"]
 # runtime never links tonic.
 grpc = ["dep:tonic", "dep:bytes", "dep:strum"]
 # Enables the `worker` module: the `Worker` state machine that drives
-# the interpreter. Off by default so host-side consumers (monty-pool, the
-# bindings) never link the interpreter itself.
+# the interpreter, with type checking. Off by default so host-side consumers
+# (monty-pool, the bindings) never link the interpreter itself.
+worker = ["worker-core", "type-checking"]
+# The `worker` module without the type checker: a session configured with
+# `type_check` is refused, and the ty/ruff checker is never built.
 # `tzdb-bundled` so every worker resolves zone names; native binaries add `tzdb` for the OS copy.
-worker = ["dep:monty", "dep:monty-type-checking", "monty-types/tzdb-bundled"]
+worker-core = ["dep:monty", "monty-types/tzdb-bundled"]
+# Type checks sessions configured with `type_check`; needs a worker feature.
+type-checking = ["dep:monty-type-checking"]
 
 [[bin]]
 name = "generate-proto"
@@ -69,6 +74,10 @@ required-features = ["generate"]
 [[test]]
 name = "dispatch"
 required-features = ["worker"]
+
+[[test]]
+name = "worker_core"
+required-features = ["worker-core"]
 
 [dev-dependencies]
 allocation-counter = "0.8"

@@ -23,7 +23,7 @@ mod requirement;
 #[doc(hidden)]
 pub mod test_util;
 mod wire;
-#[cfg(feature = "worker")]
+#[cfg(feature = "worker-core")]
 pub mod worker;
 
 /// The protocol version a client built from this code declares in

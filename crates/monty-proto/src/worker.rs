@@ -27,13 +27,15 @@ use monty::{
     CheckedSource, Dump, MontyRepl, ReplProgress, ReplStartError, Session, SessionRef, dump,
     type_check_nesting_exception,
 };
+#[cfg(feature = "type-checking")]
 use monty_type_checking::{SourceFile, TypeCheckContext, TypeChecker, scan_imports};
 use monty_types::{
-    AssertMessageAnnotations, CHECKER_MODULE_NAMES, CompileOptions, ExcType, ExecutionClock, ExtFunctionResult,
-    IMPORT_STUBS_CALL_ID, ModuleStub, MontyException, MontyObject, NamedValues, OsFunctionCall, OsPolicy, PrintStream,
-    PrintWriter, PrintWriterCallback, ResourceLimits, ResourceTracker, SANDBOX_MODULE_NAMES, SOURCE_SCAN_THRESHOLD,
-    SourceRange, TypeCheckState, TypeCheckingConfig,
+    AssertMessageAnnotations, CompileOptions, ExcType, ExecutionClock, ExtFunctionResult, IMPORT_STUBS_CALL_ID,
+    ModuleStub, MontyException, MontyObject, NamedValues, OsFunctionCall, OsPolicy, PrintStream, PrintWriter,
+    PrintWriterCallback, ResourceLimits, ResourceTracker, SOURCE_SCAN_THRESHOLD, TypeCheckState, TypeCheckingConfig,
 };
+#[cfg(feature = "type-checking")]
+use monty_types::{CHECKER_MODULE_NAMES, SANDBOX_MODULE_NAMES, SourceRange};
 
 use super::{
     BudgetVec, DEFAULT_PRINT_FLUSH_INTERVAL, FrameError, FrameReader, MAX_FRAME_LEN, ProtoConvertError,
@@ -198,6 +200,10 @@ enum SessionState {
     /// `ReplProgress::Complete` — completion ends the turn immediately.
     Suspended(Box<ReplProgress>),
     /// A feed awaiting host stubs before type checking.
+    #[cfg_attr(
+        not(feature = "type-checking"),
+        expect(dead_code, reason = "only a type-checked feed asks for import stubs")
+    )]
     AwaitingStubs(Box<PendingFeed>),
 }
 
@@ -227,6 +233,7 @@ pub struct Worker {
     /// diagnostics).
     script_name: String,
     /// Built by the first type-checked feed and dropped when the session resets.
+    #[cfg(feature = "type-checking")]
     type_checker: Option<TypeChecker>,
     /// `Some` when the session was created with `type_check: true`.
     type_check: Option<TypeCheckState>,
@@ -256,6 +263,7 @@ impl Default for Worker {
         Self {
             state: SessionState::Configured(None),
             script_name: String::new(),
+            #[cfg(feature = "type-checking")]
             type_checker: None,
             type_check: None,
             print_flush_interval: DEFAULT_PRINT_FLUSH_INTERVAL,
@@ -516,6 +524,10 @@ impl Worker {
                 Some(Ok(os_policy)) => os_policy,
                 Some(Err(err)) => return session_refused(&format!("invalid os_policy: {err}")),
             };
+            #[cfg(not(feature = "type-checking"))]
+            if configure.type_check {
+                return session_refused("type checking is not built into this worker");
+            }
             // ty walks the stubs with every feed, unguarded.
             if let Some(stubs) = &configure.type_check_stubs
                 && type_check_nesting_exception(stubs, "repl_type_stubs.pyi", SOURCE_SCAN_THRESHOLD).is_err()
@@ -667,6 +679,7 @@ impl Worker {
         // the caller explicitly excluded them from checking, so later snippets
         // must not be checked against their (unchecked) bindings either
         let type_checked = !feed.skip_type_check && self.type_check.is_some();
+        #[cfg(feature = "type-checking")]
         if type_checked && let Some(state) = &mut self.type_check {
             let imports = scan_imports(&code);
             state.pending_snippet = Some(code.clone());
@@ -1217,6 +1230,7 @@ impl Worker {
     }
 
     /// Checks against accumulated stubs and imports, returning an event on failure.
+    #[cfg(feature = "type-checking")]
     fn type_check_feed(&mut self, code: &str) -> Option<pb::WorkerEvent> {
         let state = self.type_check.as_ref()?;
         // `check_source` already ran the lexer scan, so only the AST walk is left.
@@ -1242,12 +1256,23 @@ impl Worker {
         }
     }
 
+    /// Without the checker no session is configured to type check, so there
+    /// is never a failure to report.
+    #[cfg(not(feature = "type-checking"))]
+    #[expect(clippy::unused_self, reason = "matches the type-checking build's signature")]
+    fn type_check_feed(&mut self, _code: &str) -> Option<pb::WorkerEvent> {
+        None
+    }
+
     /// Drops all session state, returning to the unconfigured state ready for
     /// the next `Configure` (or `Load`).
     fn reset(&mut self) {
         self.state = SessionState::Configured(None);
         // Invalidating source files leaves Salsa caches and interned data allocated.
-        self.type_checker = None;
+        #[cfg(feature = "type-checking")]
+        {
+            self.type_checker = None;
+        }
         self.type_check = None;
         self.script_name = String::new();
         self.print_flush_interval = DEFAULT_PRINT_FLUSH_INTERVAL;
