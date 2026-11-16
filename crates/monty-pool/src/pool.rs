@@ -188,13 +188,31 @@ impl Pool {
     /// Telemetry exporter shutdown remains the configuring application's
     /// responsibility and should happen after checked-out sessions finish.
     pub async fn close(&self) {
+        self.shut_down_idle(true, "closed").await;
+        if let Some(remote) = &self.inner.remote {
+            remote.wait_closed(self.inner.config.max_processes).await;
+        }
+    }
+
+    /// Asks idle workers to exit cleanly and reaps them, as [`Self::close`]
+    /// does, but leaves the pool open: each freed slot refills toward
+    /// `min_processes` with a fresh worker. An embedder reclaiming memory
+    /// under pressure uses this to drop the heaps idle workers grew.
+    pub async fn evict_idle(&self) {
+        self.shut_down_idle(false, "evicted").await;
+    }
+
+    /// Removes the idle workers, closing the pool first when `close`, counts
+    /// each as terminated for `reason`, asks each to exit and reaps them
+    /// concurrently, releasing every slot.
+    async fn shut_down_idle(&self, close: bool, reason: &'static str) {
         // Pair each removed worker with a capacity guard immediately: if this
-        // future is dropped mid-close, every unreaped worker is killed by its
-        // kill-on-drop handle and its slot released by the guard, instead of
-        // leaking capacity the pool can never recover.
+        // future is dropped mid-shutdown, every unreaped worker is killed by
+        // its kill-on-drop handle and its slot released by the guard, instead
+        // of leaking capacity the pool can never recover.
         let mut idle: Vec<_> = {
             let mut state = lock_ignore_poison(&self.inner.state);
-            state.closed = true;
+            state.closed |= close;
             mem::take(&mut state.idle)
         }
         .into_iter()
@@ -202,7 +220,7 @@ impl Pool {
         .collect();
         self.inner.record_worker_delta(0, -worker_count(idle.len()));
         for _ in &idle {
-            self.inner.count_termination("closed");
+            self.inner.count_termination(reason);
         }
         for (worker, _) in &mut idle {
             let _ = worker
@@ -216,9 +234,6 @@ impl Pool {
             worker.reap_or_kill(SHUTDOWN_EXIT_GRACE).await;
         }))
         .await;
-        if let Some(remote) = &self.inner.remote {
-            remote.wait_closed(self.inner.config.max_processes).await;
-        }
     }
 
     /// Number of idle workers right now (diagnostics/tests only — the value

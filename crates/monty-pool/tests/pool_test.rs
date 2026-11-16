@@ -4132,3 +4132,30 @@ async fn idle_memory_listing_reaps_workers_that_died() {
         sleep(Duration::from_millis(10)).await;
     }
 }
+
+/// Evicting idle workers shuts them down without closing the pool: their
+/// slots return, and the pool refills fresh workers to `min_processes`.
+#[cfg(unix)]
+#[tokio::test]
+async fn evicted_idle_workers_are_replaced_by_fresh_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = write_fake_monty(dir.path(), "#!/bin/sh\nsleep 30\n");
+    let mut config = PoolConfig::subprocess(&fake);
+    config.min_processes = 2;
+    config.max_processes = 2;
+    let pool = Pool::new(config).await.unwrap();
+    let evicted = pool.idle_worker_pids();
+    assert_eq!(evicted.len(), 2);
+
+    pool.evict_idle().await;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pids = pool.idle_worker_pids();
+        if pids.len() == 2 && pids.iter().all(|pid| !evicted.contains(pid)) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the pool never refilled: {pids:?}");
+        sleep(Duration::from_millis(10)).await;
+    }
+}
