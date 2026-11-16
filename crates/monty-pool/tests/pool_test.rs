@@ -45,7 +45,7 @@ use monty_types::{
     unstable::{self, MontyNode},
 };
 #[cfg(unix)]
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 use tokio::{
     sync::{Mutex as AsyncMutex, mpsc::unbounded_channel},
     time::sleep,
@@ -4035,14 +4035,14 @@ fn memory_sample(live_bytes: u64) -> pb::WorkerEvent {
 /// Polls `read` until it is `expected`, for up to ten seconds.
 #[cfg(unix)]
 async fn eventually(expected: u64, read: impl Fn() -> Option<u64>) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while read() != Some(expected) {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "memory never reached {expected}: {:?}",
             read()
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -4102,4 +4102,33 @@ async fn memory_samples_inside_a_turn_are_recorded_not_answers() {
         .expect("the Ok after the sample opens the session");
     let memory = checkout.memory().expect("a live checkout has its worker's memory");
     eventually(9, || Some(memory.live_bytes())).await;
+}
+
+/// A worker that dies while idle leaves the memory listing without a
+/// checkout: listing reaps it, frees its slot, and refills toward
+/// `min_processes`, so an embedder never accounts for a dead process.
+#[cfg(unix)]
+#[tokio::test]
+async fn idle_memory_listing_reaps_workers_that_died() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = write_fake_monty(dir.path(), "#!/bin/sh\nsleep 30\n");
+    let mut config = PoolConfig::subprocess(&fake);
+    config.min_processes = 1;
+    config.max_processes = 1;
+    let pool = Pool::new(config).await.unwrap();
+    let dead = pool.idle_worker_pids()[0];
+    kill_pid(dead);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pids: Vec<u32> = pool.idle_worker_memory().into_iter().map(|(pid, _)| pid).collect();
+        if pids.len() == 1 && pids[0] != dead {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the dead worker was never replaced: {pids:?}"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
 }

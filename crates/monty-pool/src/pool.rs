@@ -240,13 +240,30 @@ impl Pool {
 
     /// PIDs of the idle subprocess workers, each with its latest memory
     /// sample, so an embedder can account for workers it has not checked out.
+    ///
+    /// Workers that died while idle are reaped and discarded first, as
+    /// checkout does, freeing their slots and refilling toward
+    /// `min_processes`: a dead process is never listed, even while no
+    /// checkout comes to reap it.
     #[must_use]
     pub fn idle_worker_memory(&self) -> Vec<(u32, Arc<crate::WorkerMemory>)> {
-        lock_ignore_poison(&self.inner.state)
-            .idle
-            .iter()
-            .filter_map(|worker| Some((worker.pid()?, Arc::clone(worker.memory()))))
-            .collect()
+        let (died, listed) = {
+            let mut state = lock_ignore_poison(&self.inner.state);
+            let before = state.idle.len();
+            state.idle.retain_mut(|worker| !worker.is_dead());
+            let listed: Vec<_> = state
+                .idle
+                .iter()
+                .filter_map(|worker| Some((worker.pid()?, Arc::clone(worker.memory()))))
+                .collect();
+            (before - state.idle.len(), listed)
+        };
+        self.inner.record_worker_delta(0, -worker_count(died));
+        for _ in 0..died {
+            self.inner.count_termination("died_idle");
+            self.inner.release_capacity();
+        }
+        listed
     }
 }
 
