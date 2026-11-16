@@ -1079,7 +1079,7 @@ pub struct WorkerEvent {
     pub execution_clock: ::core::option::Option<i32>,
     #[prost(
         oneof = "worker_event::Kind",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16"
     )]
     pub kind: ::core::option::Option<worker_event::Kind>,
 }
@@ -1117,7 +1117,24 @@ pub mod worker_event {
         SessionRefused(super::SessionRefused),
         #[prost(message, tag = "15")]
         StreamedCalls(super::StreamedCalls),
+        #[prost(message, tag = "16")]
+        MemorySample(super::MemorySample),
     }
+}
+/// The worker process's memory, sent on the worker host's own schedule
+/// outside the request/reply alternation: it opens and ends no turn and may
+/// arrive at any time, including while the worker idles between sessions, so a
+/// parent reads its worker continuously and keeps the latest sample. Only a
+/// subprocess worker host sends it, to the pool that spawned it, and never
+/// sandbox code; a relay never forwards it to a remote client.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MemorySample {
+    /// Bytes the worker's allocator currently has live.
+    #[prost(uint64, tag = "1")]
+    pub live_bytes: u64,
+    /// Bytes the worker process's allocator has committed from the OS.
+    #[prost(uint64, tag = "2")]
+    pub committed_bytes: u64,
 }
 /// One run of print() output on a single stream, as one `Print` event may
 /// carry several.

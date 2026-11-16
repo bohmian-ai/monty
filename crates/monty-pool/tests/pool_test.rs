@@ -4022,3 +4022,84 @@ async fn a_host_decode_budget_rejects_a_subprocess_result() {
     assert_eq!(expect_complete(result), MontyObject::int(42));
     next.finish().await.unwrap();
 }
+
+/// A `MemorySample` carrying `live_bytes`.
+#[cfg(unix)]
+fn memory_sample(live_bytes: u64) -> pb::WorkerEvent {
+    worker_event(pb::worker_event::Kind::MemorySample(pb::MemorySample {
+        live_bytes,
+        committed_bytes: live_bytes * 2,
+    }))
+}
+
+/// Polls `read` until it is `expected`, for up to ten seconds.
+#[cfg(unix)]
+async fn eventually(expected: u64, read: impl Fn() -> Option<u64>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while read() != Some(expected) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "memory never reached {expected}: {:?}",
+            read()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// An idle worker's memory samples are read as they arrive, never left to
+/// fill the pipe: more samples than a pipe buffer holds all drain before
+/// any checkout, and the last one is what the pool reports.
+#[cfg(unix)]
+#[tokio::test]
+async fn idle_workers_report_memory_without_a_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut samples = Vec::new();
+    for live in 1..=20_000 {
+        samples.extend(framed(&memory_sample(live)));
+    }
+    assert!(samples.len() > 256 * 1024, "the samples outgrow any pipe buffer");
+    let samples_path = dir.path().join("samples.bin");
+    fs::write(&samples_path, &samples).unwrap();
+    let fake = write_fake_monty(
+        dir.path(),
+        &format!("#!/bin/sh\ncat '{}'\nsleep 30\n", samples_path.display()),
+    );
+    let mut config = PoolConfig::subprocess(&fake);
+    config.min_processes = 1;
+    let pool = Pool::new(config).await.unwrap();
+
+    eventually(20_000, || {
+        let idle = pool.idle_worker_memory();
+        assert!(idle.len() <= 1, "{idle:?}");
+        idle.first().map(|(_, memory)| memory.live_bytes())
+    })
+    .await;
+    let idle = pool.idle_worker_memory();
+    assert_eq!(idle[0].1.committed_bytes(), 40_000);
+    assert!(idle[0].1.age() < Duration::from_secs(10));
+}
+
+/// A memory sample arriving inside a turn is recorded and never ends it: a
+/// sample sent ahead of the `Configure` reply leaves that reply to open the
+/// session, and the checkout reports the sample.
+#[cfg(unix)]
+#[tokio::test]
+async fn memory_samples_inside_a_turn_are_recorded_not_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut replies = Vec::new();
+    replies.extend(framed(&memory_sample(9)));
+    replies.extend(framed(&worker_event(pb::worker_event::Kind::Ok(pb::Ok {}))));
+    let replies_path = dir.path().join("replies.bin");
+    fs::write(&replies_path, &replies).unwrap();
+    let fake = write_fake_monty(
+        dir.path(),
+        &format!("#!/bin/sh\ncat '{}'\nsleep 30\n", replies_path.display()),
+    );
+    let pool = Pool::new(PoolConfig::subprocess(&fake)).await.unwrap();
+    let checkout = pool
+        .checkout(&ReplConfig::default())
+        .await
+        .expect("the Ok after the sample opens the session");
+    let memory = checkout.memory().expect("a live checkout has its worker's memory");
+    eventually(9, || Some(memory.live_bytes())).await;
+}

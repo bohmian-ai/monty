@@ -5,22 +5,25 @@
 //!
 //! `recv` must be cancel-safe: the checkout races each turn against a
 //! `tokio::time` deadline, and dropping a plain `read_exact` future mid-frame
-//! would lose bytes and desync the stream. For the subprocess transport,
-//! rather than paying for a pump task and channel per worker (a cross-task
-//! wakeup per event), cancel-safety comes from keeping the partial-frame
-//! state *in the worker*: [`FrameRecv`] holds the buffer and fill offset
-//! across polls, so a dropped `recv` future loses nothing and the next call
-//! resumes exactly where it stopped.
+//! would lose bytes and desync the stream.
 //!
-//! The remote transport runs a background reader task instead — not for
-//! cancel-safety but for liveness: an idle client polls nothing, so a server's
-//! `Ping` would go unanswered and a keepalive server would drop the session
-//! as vanished. `recv` reads the task's channel, which is cancel-safe.
+//! Both transports read through a background reader task, and `recv` reads
+//! the task's channel, which is cancel-safe. The task exists for liveness, not
+//! cancel-safety: an idle pool polls nothing, so a subprocess host's
+//! [`pb::MemorySample`]s would fill the pipe and a remote server's `Ping`
+//! would go unanswered. The subprocess task records each sample on
+//! [`WorkerMemory`] as it arrives, idle or mid-turn, at the cost of a
+//! cross-task wakeup per event; [`FrameRecv`] keeps its partial-frame state
+//! inside the task.
 
 use std::{
     env, io,
     path::PathBuf,
     process::{ExitStatus, Stdio},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -33,8 +36,9 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdin, ChildStdout, Command},
     runtime::{Handle, RuntimeFlavor},
-    task::block_in_place,
-    time::timeout,
+    sync::mpsc,
+    task::{JoinHandle, block_in_place},
+    time::{Instant, timeout},
 };
 
 #[cfg(feature = "telemetry")]
@@ -45,11 +49,69 @@ use crate::{
     remote::{Remote, RemoteWorker},
 };
 
+/// The latest memory sample a subprocess worker's host reported.
+///
+/// The host sends a [`pb::MemorySample`] on its own schedule, outside the
+/// request/reply alternation, and the worker's reader records each as it
+/// arrives, including while the worker idles in the pool. A worker that stops
+/// reporting keeps its last sample, and [`Self::age`] says how old it is.
+/// Shared through [`crate::Checkout::memory`] and
+/// [`crate::Pool::idle_worker_memory`].
+#[derive(Debug)]
+pub struct WorkerMemory {
+    /// Bytes the worker's allocator last reported live.
+    live_bytes: AtomicU64,
+    /// Bytes the worker's allocator last reported committed from the OS.
+    committed_bytes: AtomicU64,
+    /// When the last sample arrived, or when the worker started before its
+    /// first sample.
+    received: Mutex<Instant>,
+}
+
+impl WorkerMemory {
+    /// A worker starting now, with no sample yet.
+    fn new() -> Self {
+        Self {
+            live_bytes: AtomicU64::new(0),
+            committed_bytes: AtomicU64::new(0),
+            received: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Records `sample` as the latest, received now.
+    fn record(&self, sample: &pb::MemorySample) {
+        self.live_bytes.store(sample.live_bytes, Ordering::Relaxed);
+        self.committed_bytes.store(sample.committed_bytes, Ordering::Relaxed);
+        *self.received.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+    }
+
+    /// Bytes the worker's allocator last reported live; zero before its first sample.
+    #[must_use]
+    pub fn live_bytes(&self) -> u64 {
+        self.live_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes the worker's allocator last reported committed; zero before its first sample.
+    #[must_use]
+    pub fn committed_bytes(&self) -> u64 {
+        self.committed_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Time since the last sample arrived, or since the worker started when
+    /// none has.
+    #[must_use]
+    pub fn age(&self) -> Duration {
+        self.received.lock().unwrap_or_else(PoisonError::into_inner).elapsed()
+    }
+}
+
 /// A worker plus its recycle counter. The transport-specific I/O halves live
-/// in [`WorkerKind`]; both transports keep any partial-read state inside the
-/// worker so `recv` is cancel-safe (see the module docs).
+/// in [`WorkerKind`]; both transports read through a reader task's channel so
+/// `recv` is cancel-safe (see the module docs).
 pub(crate) struct Worker {
     kind: WorkerKind,
+    /// The latest memory sample the worker's host reported.
+    memory: Arc<WorkerMemory>,
     /// Host-selected allocation budget for decoding each protocol frame.
     max_decode_bytes: usize,
     /// Wire length of the last event `recv` returned, which the streamed-call budget charges.
@@ -77,15 +139,25 @@ enum WorkerKind {
 }
 
 /// A local `monty subprocess` child: the process handle (kill-on-drop), its
-/// framed stdin, and the cancel-safe stdout frame reader.
+/// framed stdin, and the events its stdout reader task forwards.
 struct SubprocessWorker {
     child: Child,
     /// The child's CPU clock, recorded at spawn in CPU mode; `None` in wall mode.
     cpu_clock: Option<Clock>,
     stdin: ChildStdin,
-    recv: FrameRecv,
+    /// Decoded events, or the terminal EOF or error, from the reader task.
+    events: mpsc::Receiver<Result<Option<(pb::WorkerEvent, usize)>, FrameError>>,
+    /// The task reading stdout; aborted with the worker.
+    reader: JoinHandle<()>,
     /// Reused encode buffer for outgoing frames (see [`Worker::send`]).
     send_buf: Vec<u8>,
+}
+
+/// Stops the stdout reader with the worker, whose child is killed on drop.
+impl Drop for SubprocessWorker {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 impl Worker {
@@ -99,7 +171,9 @@ impl Worker {
         metadata: &[(String, String)],
     ) -> Result<Self, PoolError> {
         let worker = match &config.transport {
-            MontyTransport::Subprocess(binary_path) => Self::subprocess(binary_path, config.execution_clock),
+            MontyTransport::Subprocess(binary_path) => {
+                Self::subprocess(binary_path, config.execution_clock, config.max_decode_bytes)
+            }
             MontyTransport::Remote(_) => {
                 let remote = remote.expect("a remote pool holds its channel");
                 remote
@@ -130,8 +204,13 @@ impl Worker {
     /// `Configure` of its first checkout).
     ///
     /// CPU mode records the child's CPU clock here, while the child is certainly
-    /// unreaped, so later reads can detect a reused PID (see [`Clock`]).
-    fn subprocess(binary_path: &PathBuf, execution_clock: ExecutionClock) -> Result<Self, PoolError> {
+    /// unreaped, so later reads can detect a reused PID (see [`Clock`]). The
+    /// stdout reader task decodes each frame within `max_decode_bytes`.
+    fn subprocess(
+        binary_path: &PathBuf,
+        execution_clock: ExecutionClock,
+        max_decode_bytes: usize,
+    ) -> Result<Self, PoolError> {
         let mut command = Command::new(binary_path);
         command
             .arg("subprocess")
@@ -163,13 +242,24 @@ impl Worker {
         };
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
-        Ok(Self::from_kind(WorkerKind::Subprocess(Box::new(SubprocessWorker {
+        let memory = Arc::new(WorkerMemory::new());
+        let (sender, events) = mpsc::channel(SUBPROCESS_EVENT_CHANNEL_DEPTH);
+        let reader = tokio::spawn(read_subprocess_events(
+            FrameRecv::new(stdout),
+            max_decode_bytes,
+            sender,
+            Arc::clone(&memory),
+        ));
+        let mut worker = Self::from_kind(WorkerKind::Subprocess(Box::new(SubprocessWorker {
             child,
             cpu_clock,
             stdin,
-            recv: FrameRecv::new(stdout),
+            events,
+            reader,
             send_buf: Vec::with_capacity(SEND_BUF_CAPACITY),
-        }))))
+        })));
+        worker.memory = memory;
+        Ok(worker)
     }
 
     /// Wraps a transport in a fresh, unnumbered worker; `new` then applies the
@@ -177,6 +267,7 @@ impl Worker {
     fn from_kind(kind: WorkerKind) -> Self {
         Self {
             kind,
+            memory: Arc::new(WorkerMemory::new()),
             max_decode_bytes: DEFAULT_MAX_DECODE_BYTES,
             last_frame_len: 0,
             id: 0,
@@ -296,22 +387,36 @@ impl Worker {
         }
     }
 
+    /// The latest memory sample this worker's host reported.
+    pub(crate) const fn memory(&self) -> &Arc<WorkerMemory> {
+        &self.memory
+    }
+
     /// Receives one event. EOF/close is an error here because within a
-    /// checkout the worker must never close its side first.
+    /// checkout the worker must never close its side first. A
+    /// [`pb::MemorySample`] is recorded on [`Self::memory`] and never returned.
     ///
-    /// Cancel-safe: partial-frame state persists in the worker (see the
+    /// Cancel-safe: both transports read a reader task's channel (see the
     /// module docs), which is what lets `Checkout` race a turn against its
     /// deadline.
     pub(crate) async fn recv(&mut self) -> Result<pb::WorkerEvent, FrameError> {
-        let (event, len) = match &mut self.kind {
-            WorkerKind::Subprocess(w) => match w.recv.recv(self.max_decode_bytes).await? {
-                Some(framed) => Ok(framed),
-                None => Err(FrameError::Truncated), // clean EOF mid-checkout is still a vanished peer
-            },
+        let (event, len) = loop {
             // events come from the reader task; a channel recv is
             // cancel-safe, preserving the deadline race
-            WorkerKind::Remote(w) => w.recv().await,
-        }?;
+            let (event, len) = match &mut self.kind {
+                WorkerKind::Subprocess(w) => match w.events.recv().await {
+                    Some(Ok(Some(framed))) => Ok(framed),
+                    Some(Err(err)) => Err(err),
+                    // clean EOF mid-checkout is still a vanished peer
+                    Some(Ok(None)) | None => Err(FrameError::Truncated),
+                },
+                WorkerKind::Remote(w) => w.recv().await,
+            }?;
+            match &event.kind {
+                Some(pb::worker_event::Kind::MemorySample(sample)) => self.memory.record(sample),
+                _ => break (event, len),
+            }
+        };
         // only after a complete decode, so a `recv` future dropped mid-frame
         // (deadline race) records nothing — cancel-safety intact
         #[cfg(feature = "telemetry")]
@@ -425,6 +530,41 @@ const RETAIN_BUF_MAX: usize = 64 * 1024;
 /// resumes with small values, and `Configure` (~150 bytes) without a realloc;
 /// only large feeds/values grow past it (via `encode_framed_into`'s reserve).
 const SEND_BUF_CAPACITY: usize = 1024;
+
+/// Depth of the subprocess reader's channel to `recv`: one decoded event, as
+/// the strict alternation never has more than one outstanding.
+const SUBPROCESS_EVENT_CHANNEL_DEPTH: usize = 1;
+
+/// The subprocess reader task: reads stdout continuously so the host's
+/// [`pb::MemorySample`]s are recorded on `memory` even while the worker is
+/// idle, and forwards every other event, or the terminal EOF or error, to
+/// `recv`.
+///
+/// A forwarded event waits in the channel until a turn reads it. The strict
+/// alternation leaves none outstanding while the worker is idle, so idle
+/// samples keep flowing; a misbehaving child that sends one anyway stops the
+/// reads, and its sample then ages instead of being lost silently.
+async fn read_subprocess_events(
+    mut frames: FrameRecv,
+    max_decode_bytes: usize,
+    events: mpsc::Sender<Result<Option<(pb::WorkerEvent, usize)>, FrameError>>,
+    memory: Arc<WorkerMemory>,
+) {
+    loop {
+        let read = frames.recv(max_decode_bytes).await;
+        if let Ok(Some((event, _))) = &read
+            && let Some(pb::worker_event::Kind::MemorySample(sample)) = &event.kind
+        {
+            memory.record(sample);
+            continue;
+        }
+        let last = !matches!(read, Ok(Some(_)));
+        // a failed send means the receiver dropped: the worker is gone
+        if events.send(read).await.is_err() || last {
+            return;
+        }
+    }
+}
 
 /// Frames at or above this size decode under `block_in_place` (see
 /// [`decode_event`]); below it (< ~4ms) inline decode beats the handoff.

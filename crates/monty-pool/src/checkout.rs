@@ -754,9 +754,14 @@ fn opens_session(request: &pb::ClientRequest) -> bool {
     )
 }
 
-/// Whether `event` ends its turn: anything but a mid-turn event or a liveness `Ping`.
+/// Whether `event` ends its turn: anything but a mid-turn event, a liveness
+/// `Ping`, or a `MemorySample`.
 fn ends_turn(event: &pb::WorkerEvent) -> bool {
-    !is_mid_turn(event) && !matches!(event.kind, Some(pb::worker_event::Kind::Ping(_)))
+    !is_mid_turn(event)
+        && !matches!(
+            event.kind,
+            Some(pb::worker_event::Kind::Ping(_) | pb::worker_event::Kind::MemorySample(_))
+        )
 }
 
 /// Whether a turn-ending reply to a `Configure` carries its acknowledgement:
@@ -1481,6 +1486,13 @@ impl Checkout {
         self.worker.as_ref().and_then(Worker::pid)
     }
 
+    /// The latest memory sample this checkout's worker reported, shared with
+    /// the worker for its whole life; `None` once the checkout is finished.
+    #[must_use]
+    pub fn memory(&self) -> Option<Arc<crate::WorkerMemory>> {
+        self.worker.as_ref().map(|worker| Arc::clone(worker.memory()))
+    }
+
     /// The opaque session ID a storing relay minted, which [`Checkout::restore`]
     /// resumes from any process. `None` for local workers and ephemeral sessions,
     /// and until the session opens: call [`Checkout::open`] first to wait for it.
@@ -2184,6 +2196,8 @@ impl Checkout {
                 // answered by the remote transport's reader task before it
                 // reaches here, and never sent by a subprocess; not a turn end
                 Some(pb::worker_event::Kind::Ping(_)) => {}
+                // recorded by `Worker::recv`, which never returns it
+                Some(pb::worker_event::Kind::MemorySample(_)) => {}
                 Some(pb::worker_event::Kind::Print(print)) => {
                     #[cfg(feature = "telemetry")]
                     let context = self.callback_context();

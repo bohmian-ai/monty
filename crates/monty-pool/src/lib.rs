@@ -29,6 +29,7 @@ pub use crate::{
         PrintFuture, ReplConfig, ResumeValue, StreamedCall, TurnEvent, on_print_sync,
     },
     pool::Pool,
+    worker::WorkerMemory,
 };
 
 /// How the pool reaches its workers.

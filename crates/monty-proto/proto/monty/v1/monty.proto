@@ -850,6 +850,7 @@ message WorkerEvent {
     Ping ping = 13;
     SessionRefused session_refused = 14;
     StreamedCalls streamed_calls = 15;
+    MemorySample memory_sample = 16;
   }
 
   // Cumulative execution time consumed by the session's sandbox code, in
@@ -910,6 +911,19 @@ enum PrintStream {
   PRINT_STREAM_UNSPECIFIED = 0;
   PRINT_STREAM_STDOUT = 1;
   PRINT_STREAM_STDERR = 2;
+}
+
+// The worker process's memory, sent on the worker host's own schedule
+// outside the request/reply alternation: it opens and ends no turn and may
+// arrive at any time, including while the worker idles between sessions, so a
+// parent reads its worker continuously and keeps the latest sample. Only a
+// subprocess worker host sends it, to the pool that spawned it, and never
+// sandbox code; a relay never forwards it to a remote client.
+message MemorySample {
+  // Bytes the worker's allocator currently has live.
+  uint64 live_bytes = 1;
+  // Bytes the worker process's allocator has committed from the OS.
+  uint64 committed_bytes = 2;
 }
 
 // One run of print() output on a single stream, as one `Print` event may

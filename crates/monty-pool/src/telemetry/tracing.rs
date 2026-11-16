@@ -509,8 +509,8 @@ impl Recorder {
                 );
                 self.end_feed();
             }
-            // liveness, not a turn (and answered by the transport, never seen here)
-            Some(pb::worker_event::Kind::Ping(_)) => {}
+            // liveness and memory samples, not turns (and answered by the transport, never seen here)
+            Some(pb::worker_event::Kind::Ping(_) | pb::worker_event::Kind::MemorySample(_)) => {}
             None => logfire::error!(parent: self.context_span(), "event with no kind"),
         }
     }

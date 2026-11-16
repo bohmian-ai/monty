@@ -651,8 +651,8 @@ impl TurnMetrics {
             // the worker is about to exit; the pool counts the termination
             Some(pb::worker_event::Kind::FatalError(_)) => self.end_terminal("fatal_error", event),
             Some(pb::worker_event::Kind::Shutdown(_)) => self.end_terminal("shutdown", event),
-            // liveness, not a turn (answered by the transport, never seen here)
-            Some(pb::worker_event::Kind::Ping(_)) => {}
+            // liveness and memory samples, not turns (answered by the transport, never seen here)
+            Some(pb::worker_event::Kind::Ping(_) | pb::worker_event::Kind::MemorySample(_)) => {}
             None => {}
         }
     }

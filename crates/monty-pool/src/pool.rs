@@ -237,6 +237,17 @@ impl Pool {
             .filter_map(Worker::pid)
             .collect()
     }
+
+    /// PIDs of the idle subprocess workers, each with its latest memory
+    /// sample, so an embedder can account for workers it has not checked out.
+    #[must_use]
+    pub fn idle_worker_memory(&self) -> Vec<(u32, Arc<crate::WorkerMemory>)> {
+        lock_ignore_poison(&self.inner.state)
+            .idle
+            .iter()
+            .filter_map(|worker| Some((worker.pid()?, Arc::clone(worker.memory()))))
+            .collect()
+    }
 }
 
 impl Drop for Pool {

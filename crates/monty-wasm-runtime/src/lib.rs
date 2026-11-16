@@ -504,6 +504,9 @@ fn event_from_proto(event: pb::WorkerEvent) -> Event {
         Some(pb::worker_event::Kind::Print(_)) => invalid_event("Print event bypassed segment expansion"),
         // a serving relay's liveness probe; a worker never sends one
         Some(pb::worker_event::Kind::Ping(_)) => invalid_event("Ping event is a relay's, never a worker's"),
+        Some(pb::worker_event::Kind::MemorySample(_)) => {
+            invalid_event("MemorySample event is a subprocess host's, never a wasm worker's")
+        }
         Some(pb::worker_event::Kind::FunctionCall(call)) => {
             let object_id = call.object_id.map(|uuid| uuid.to_string());
             let position = component_source_range(call.position.unwrap_or_else(monty_types::SourceRange::unknown));
